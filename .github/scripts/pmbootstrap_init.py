@@ -11,15 +11,38 @@ Reference: the interactive prompt sequence observed in
 
 Chinese font packages are ALWAYS added to the extra packages list,
 regardless of what the user supplies in PMOS_EXTRA_PACKAGES.
+
+ANSI handling
+-------------
+pmbootstrap prints prompts with ANSI color codes (BOLD before the
+prompt text, END after it). The actual byte sequence for the work
+path prompt is:
+
+    [21:50:34] \\x1b[1mWork path [/home/...]\\x1b[0m: 
+
+The \\x1b[0m (END) sits BETWEEN the closing ']' and the ': ', which
+breaks naive regexes like `Work path \\[[^\\]]*\\]:`.
+
+Fix: set NO_COLOR=1 in the child's environment. pmbootstrap checks
+for this (see pmb/config/__init__.py) and disables ALL ANSI codes,
+so prompts come out as plain text:
+
+    [21:50:34] Work path [/home/...]: 
+
+and the original regexes work as-is.
+
+We also pass `--details-to-stdout` is NOT used (it's for logging,
+not prompts). And we set PYTHONUNBUFFERED=1 so output isn't buffered.
 """
 
 import os
+import re
 import sys
 import subprocess
+import time
 
 # ---------------------------------------------------------------------
-# Make sure pexpect is available (python3-pexpect should be installed
-# by the workflow, but fall back to pip if not).
+# Make sure pexpect is available.
 # ---------------------------------------------------------------------
 try:
     import pexpect
@@ -52,7 +75,7 @@ DEVICE = "polaris"
 
 # Locale / timezone / hostname are fixed for a CN-oriented build.
 LOCALE   = "zh_CN"
-TIMEZONE = "Asia/Shanghai"   # must also be set on the host via timedatectl
+TIMEZONE = "Asia/Shanghai"
 HOSTNAME = ""                # empty = default (xiaomi-polaris)
 
 # Chinese font packages — ALWAYS installed, no matter what.
@@ -62,9 +85,7 @@ CHINESE_FONTS = [
     "font-wqy-microhei",     # 文泉驿微米黑
 ]
 
-# ---------------------------------------------------------------------
-# Build the extra-packages list (user extras + Chinese fonts, deduped).
-# ---------------------------------------------------------------------
+
 def build_extra_packages() -> str:
     extras: list[str] = []
     if extra_packages and extra_packages.lower() != "none":
@@ -96,27 +117,62 @@ print(f"  Extra packages:   {extras_str}")
 print(f"  Locale:           {LOCALE}.UTF-8")
 print(f"  Timezone:         {TIMEZONE}")
 print(f"  Hostname:         (default = xiaomi-polaris)")
+print(f"  NO_COLOR:         1 (disables pmbootstrap ANSI codes)")
 print("=" * 60, flush=True)
 
 
 # ---------------------------------------------------------------------
-# Helper: expect a prompt and optionally send a line.
+# Spawn pmbootstrap init.
+#
+# CRITICAL environment variables:
+#   NO_COLOR=1          — pmbootstrap disables all ANSI color codes.
+#                         Without this, prompts look like
+#                         "\\x1b[1mWork path [...]\\x1b[0m: " and the
+#                         END code between ']' and ':' breaks regexes.
+#   PYTHONUNBUFFERED=1  — Python child output is unbuffered.
+#   CI is left as-is    — pmbootstrap detects CI and sets a 900s
+#                         subprocess timeout, which is fine.
 # ---------------------------------------------------------------------
-def expect_send(child, pattern, send_text="", timeout=1800, step=""):
-    """Wait for `pattern`, then send `send_text` + newline."""
+print("\n[init] spawning: pmbootstrap init (with NO_COLOR=1)\n", flush=True)
+
+spawn_env = os.environ.copy()
+spawn_env["NO_COLOR"] = "1"
+spawn_env["PYTHONUNBUFFERED"] = "1"
+
+child = pexpect.spawn(
+    "pmbootstrap init",
+    timeout=300,            # 5 min per expect() call — generous
+    encoding="utf-8",
+    maxread=4000,
+    env=spawn_env,
+)
+# Echo all output to stdout so it shows up in the Actions log.
+child.logfile = sys.stdout
+
+
+# ---------------------------------------------------------------------
+# Helper: expect a prompt and optionally send a line.
+# Uses pexpect's native expect() — relies on NO_COLOR=1 to keep
+# prompts ANSI-free.
+# ---------------------------------------------------------------------
+def expect_send(pattern, send_text="", timeout=300, step=""):
     if step:
         print(f"\n[init] {step}", flush=True)
+    print(f"[init]   -> waiting for: {pattern!r}", flush=True)
     try:
         child.expect(pattern, timeout=timeout)
     except pexpect.exceptions.TIMEOUT:
-        print(f"\n[init] ERROR: timeout waiting for: {pattern}", file=sys.stderr, flush=True)
-        print(f"[init] last output:\n{child.before}", file=sys.stderr, flush=True)
+        print(f"\n[init] ERROR: timeout ({timeout}s) waiting for: {pattern}", file=sys.stderr, flush=True)
+        print(f"[init] last 1500 chars of output:", file=sys.stderr, flush=True)
+        print(f"{child.before[-1500:] if child.before else '(none)'}", file=sys.stderr, flush=True)
         sys.exit(1)
     except pexpect.exceptions.EOF:
         print(f"\n[init] ERROR: pmbootstrap exited unexpectedly", file=sys.stderr, flush=True)
         print(f"[init] pattern not matched: {pattern}", file=sys.stderr, flush=True)
-        print(f"[init] last output:\n{child.before}", file=sys.stderr, flush=True)
+        print(f"[init] last 1500 chars of output:", file=sys.stderr, flush=True)
+        print(f"{child.before[-1500:] if child.before else '(none)'}", file=sys.stderr, flush=True)
         sys.exit(1)
+    print(f"[init]   -> matched!", flush=True)
     if send_text:
         print(f"[init]   -> sending: {send_text!r}", flush=True)
         child.sendline(send_text)
@@ -126,78 +182,79 @@ def expect_send(child, pattern, send_text="", timeout=1800, step=""):
 
 
 # ---------------------------------------------------------------------
-# Spawn pmbootstrap init.
+# Steps 1-10: simple sequential prompts.
 # ---------------------------------------------------------------------
-print("\n[init] spawning: pmbootstrap init\n", flush=True)
-child = pexpect.spawn(
-    "pmbootstrap init",
-    timeout=1800,
-    encoding="utf-8",
-    maxread=20000,
-)
-# Echo all output to stdout so it shows up in the Actions log.
-child.logfile = sys.stdout
-
 
 # 1. Work path (default)
-expect_send(child,
+expect_send(
     r"Work path \[[^\]]*\]:",
     send_text="",
-    step="Step 1/14: Work path (default)")
+    step="Step 1/14: Work path (default)",
+)
 
 # 2. pmaports path (default)
-expect_send(child,
+expect_send(
     r"pmaports path \[[^\]]*\]:",
     send_text="",
-    step="Step 2/14: pmaports path (default)")
+    step="Step 2/14: pmaports path (default)",
+)
 
 # 3. Channel
-expect_send(child,
+expect_send(
     r"Channel \[[^\]]*\]:",
     send_text=channel,
-    step=f"Step 3/14: Channel = {channel}")
+    step=f"Step 3/14: Channel = {channel}",
+)
 
 # 4. Vendor (xiaomi, FIXED)
-expect_send(child,
+expect_send(
     r"Vendor \[[^\]]*\]:",
     send_text=VENDOR,
-    step=f"Step 4/14: Vendor = {VENDOR}")
+    step=f"Step 4/14: Vendor = {VENDOR}",
+)
 
 # 5. Device codename (polaris, FIXED)
-expect_send(child,
+expect_send(
     r"Device codename:",
     send_text=DEVICE,
-    step=f"Step 5/14: Device = {DEVICE}")
+    step=f"Step 5/14: Device = {DEVICE}",
+)
 
 # 6. Username (default 'user')
-expect_send(child,
+expect_send(
     r"Username \[[^\]]*\]:",
     send_text="",
-    step="Step 6/14: Username (default: user)")
+    step="Step 6/14: Username (default: user)",
+)
 
 # 7. Audio backend provider
-expect_send(child,
+expect_send(
     r"Provider \[default\]:",
     send_text=audio,
-    step=f"Step 7/14: Audio backend = {audio}")
+    step=f"Step 7/14: Audio backend = {audio}",
+)
 
 # 8. WiFi backend provider
-expect_send(child,
+expect_send(
     r"Provider \[default\]:",
     send_text=wifi,
-    step=f"Step 8/14: WiFi backend = {wifi}")
+    step=f"Step 8/14: WiFi backend = {wifi}",
+)
 
 # 9. USB-moded default profile
-expect_send(child,
+expect_send(
     r"Provider \[default\]:",
     send_text=usb_mode,
-    step=f"Step 9/14: USB mode = {usb_mode}")
+    step=f"Step 9/14: USB mode = {usb_mode}",
+)
 
 # 10. User interface
-expect_send(child,
+expect_send(
     r"User interface \[[^\]]*\]:",
     send_text=ui,
-    step=f"Step 10/14: User interface = {ui}")
+    step=f"Step 10/14: User interface = {ui}",
+)
+
 
 # ---------------------------------------------------------------------
 # Step 11 & 12: UI extra package (CONDITIONAL) + systemd install.
@@ -213,42 +270,48 @@ print(f"\n[init] Step 11-12/14: UI extra package (if any) + systemd", flush=True
 index = child.expect([
     r"Enable this package\? \(y/n\) \[n\]:",
     r"Install systemd\? \(default/always/never\) \[default\]:",
-], timeout=1800)
+], timeout=300)
 
 if index == 0:
     # UI extra package prompt appeared → answer it, then expect systemd.
     print(f"[init]   -> UI extra package prompt found, sending: {ui_extra!r}", flush=True)
     child.sendline(ui_extra)
-    expect_send(child,
+    expect_send(
         r"Install systemd\? \(default/always/never\) \[default\]:",
         send_text=systemd,
-        step=f"Step 12/14: systemd = {systemd}")
+        step=f"Step 12/14: systemd = {systemd}",
+    )
 else:
     # No extra-package prompt → systemd prompt appeared directly.
     print(f"[init]   -> no UI extra package prompt (UI has none)", flush=True)
     print(f"[init]   -> sending systemd choice: {systemd!r}", flush=True)
     child.sendline(systemd)
 
+
+# ---------------------------------------------------------------------
+# Steps 13-17: more sequential prompts.
+# ---------------------------------------------------------------------
+
 # 13. "Change additional options?" → no (default)
-expect_send(child,
+expect_send(
     r"Change them\? \(y/n\) \[n\]:",
     send_text="",
-    step="Step 13/14: Change additional options? (no)")
+    step="Step 13/14: Change additional options? (no)",
+)
 
 # 14. Extra packages
-expect_send(child,
+expect_send(
     r"Extra packages \[none\]:",
     send_text=extras_str,
-    step=f"Step 14/14: Extra packages = {extras_str}")
+    step=f"Step 14/14: Extra packages = {extras_str}",
+)
 
-# ---------------------------------------------------------------------
-# Step 15: Timezone — "Use this timezone instead of GMT? (y/n) [y]:"
-# (We pre-set the host TZ to Asia/Shanghai, so the default is correct.)
-# ---------------------------------------------------------------------
-expect_send(child,
+# 15. Timezone — "Use this timezone instead of GMT? (y/n) [y]:"
+expect_send(
     r"Use this timezone instead of GMT\? \(y/n\) \[y\]:",
     send_text="",
-    step=f"Step 15/17: Timezone (default = host = {TIMEZONE})")
+    step=f"Step 15/17: Timezone (default = host = {TIMEZONE})",
+)
 
 # ---------------------------------------------------------------------
 # Step 16: Locale — may prompt ONCE or TWICE depending on readline
@@ -264,7 +327,7 @@ while True:
     ], timeout=300)
     if idx == 0:
         locale_attempts += 1
-        if locale_attempts > 4:
+        if locale_attempts > 6:
             print(f"[init] ERROR: too many locale prompts ({locale_attempts})", file=sys.stderr, flush=True)
             sys.exit(1)
         print(f"[init]   -> Locale prompt #{locale_attempts}, sending: {LOCALE!r}", flush=True)
@@ -276,14 +339,12 @@ while True:
         child.sendline("")
         break
 
-# ---------------------------------------------------------------------
-# Step 17: "Build outdated packages during 'pmbootstrap install'? (y/n) [y]:"
-# We always answer "y" — this is what the user picked in the file.
-# ---------------------------------------------------------------------
-expect_send(child,
+# 17. "Build outdated packages during 'pmbootstrap install'? (y/n) [y]:"
+expect_send(
     r"Build outdated packages.*\(y/n\) \[y\]:",
     send_text="y",
-    step="Step 17/17: Build outdated packages? (yes)")
+    step="Step 17/17: Build outdated packages? (yes)",
+)
 
 # ---------------------------------------------------------------------
 # Wait for pmbootstrap init to finish.
@@ -293,7 +354,7 @@ try:
     child.expect(pexpect.EOF, timeout=1800)
 except pexpect.exceptions.TIMEOUT:
     print(f"\n[init] ERROR: pmbootstrap init did not finish within timeout", file=sys.stderr, flush=True)
-    print(f"[init] last output:\n{child.before}", file=sys.stderr, flush=True)
+    print(f"[init] last 1500 chars: {child.before[-1500:] if child.before else '(none)'}", file=sys.stderr, flush=True)
     sys.exit(1)
 
 print("\n[init] ===========================================", flush=True)
