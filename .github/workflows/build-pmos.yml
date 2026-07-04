@@ -212,9 +212,15 @@ jobs:
 
       - name: Set up Python venv and install pmbootstrap
         run: |
+          # pmbootstrap is NOT published on PyPI — install from upstream Git.
+          # Pin to a known-good release tag for reproducibility.
+          # (Bump this tag when a new pmbootstrap release comes out.)
+          PMBOOTSTRAP_VERSION="3.10.3"
+
           python3 -m venv /opt/pmbootstrap-venv
           /opt/pmbootstrap-venv/bin/pip install --upgrade pip setuptools wheel
-          /opt/pmbootstrap-venv/bin/pip install pmbootstrap
+          /opt/pmbootstrap-venv/bin/pip install \
+            "git+https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git@${PMBOOTSTRAP_VERSION}"
           echo "/opt/pmbootstrap-venv/bin" >> $GITHUB_PATH
 
       - name: Verify pmbootstrap
