@@ -1,0 +1,440 @@
+name: Build postmarketOS (Xiaomi Polaris)
+
+# =====================================================================
+# Manual trigger only — does NOT run automatically on push / schedule.
+# Go to the "Actions" tab in your GitHub repo, select this workflow,
+# click "Run workflow", pick your options, and click the green button.
+# =====================================================================
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'postmarketOS release channel'
+        required: true
+        default: 'edge'
+        type: choice
+        options:
+          - edge
+          - v26.06
+          - v25.12
+
+      audio_backend:
+        description: 'Audio backend provider'
+        required: true
+        default: 'pipewire'
+        type: choice
+        options:
+          - pulseaudio
+          - pipewire
+
+      wifi_backend:
+        description: 'WiFi backend provider'
+        required: true
+        default: 'iwd'
+        type: choice
+        options:
+          - wpa_supplicant
+          - iwd
+
+      usb_mode:
+        description: 'USB-moded default profile (developer = always-on USB networking, charging = manual enable)'
+        required: true
+        default: 'developer'
+        type: choice
+        options:
+          - developer
+          - charging
+
+      user_interface:
+        description: 'User interface (plasma-mobile / phosh / console etc.)'
+        required: true
+        default: 'plasma-mobile'
+        type: choice
+        options:
+          - console
+          - phosh
+          - plasma-mobile
+          - plasma-desktop
+          - plasma-bigscreen
+          - gnome
+          - gnome-mobile
+          - xfce4
+          - mate
+          - lxqt
+          - sway
+          - i3wm
+          - openbox
+          - windowmaker
+          - weston
+          - cage
+          - niri
+          - lomiri
+          - kodi
+          - moonlight
+          - retroarch
+          - shelli
+          - fbkeyboard
+          - buffyboard
+          - sxmo-de-sway
+          - sxmo-de-dwm
+          - sxmo-de-i3
+          - sxmo-de-river
+          - os-installer
+          - none
+
+      enable_ui_extra:
+        description: 'Enable UI extra packages if the UI offers any (e.g. Plasma Mobile apps)'
+        required: false
+        default: true
+        type: boolean
+
+      systemd_install:
+        description: 'Install systemd (default = depends on UI, always = force systemd, never = force OpenRC)'
+        required: true
+        default: 'always'
+        type: choice
+        options:
+          - default
+          - always
+          - never
+
+      extra_packages:
+        description: 'Extra packages to install (comma-separated). Chinese fonts are ALWAYS added automatically.'
+        required: false
+        default: ''
+        type: string
+
+      enable_fde:
+        description: 'Enable Full Disk Encryption (recommended for Android-based devices like polaris)'
+        required: false
+        default: true
+        type: boolean
+
+      device_password:
+        description: 'Device user/encryption password (DEFAULT = 147258, change it on the phone after first boot!). The password is logged in plain text — do not use a real password here.'
+        required: false
+        default: '147258'
+        type: string
+
+      build_recovery_zip:
+        description: 'Also build an Android recovery zip (flashable via TWRP/OrangeFox)'
+        required: false
+        default: false
+        type: boolean
+
+      force_clean:
+        description: 'Run "pmbootstrap zap" before building (clears all chroots/caches, slower but cleaner)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  PMBOOTSTRAP_WORK: /home/runner/.local/var/pmbootstrap
+
+jobs:
+  build:
+    name: Build pmOS for xiaomi-polaris
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show selected options
+        run: |
+          cat <<EOF
+          ===============================================
+          postmarketOS build configuration
+          ===============================================
+          Device:           xiaomi-polaris (FIXED)
+          Channel:          ${{ inputs.channel }}
+          UI:               ${{ inputs.user_interface }}
+          Audio backend:    ${{ inputs.audio_backend }}
+          WiFi backend:     ${{ inputs.wifi_backend }}
+          USB mode:         ${{ inputs.usb_mode }}
+          systemd:          ${{ inputs.systemd_install }}
+          UI extra pkgs:    ${{ inputs.enable_ui_extra }}
+          Extra packages:   ${{ inputs.extra_packages }}
+          Chinese fonts:    font-noto-cjk, font-wqy-zenhei, font-wqy-microhei (auto-added)
+          FDE:              ${{ inputs.enable_fde }}
+          Device password:  ${{ inputs.device_password }}  <<< CHANGE THIS AFTER FIRST BOOT!
+          Recovery zip:     ${{ inputs.build_recovery_zip }}
+          Force clean:      ${{ inputs.force_clean }}
+          Locale:           zh_CN.UTF-8
+          Timezone:         Asia/Shanghai
+          ===============================================
+          EOF
+
+      - name: Free disk space on runner
+        run: |
+          echo "=== Before cleanup ==="
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/.ghcup \
+            /usr/local/share/boost \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            /usr/lib/jvm \
+            /usr/local/lib/heroku
+          sudo apt-get clean
+          sudo apt-get autoremove -y
+          docker system prune -af --volumes 2>/dev/null || true
+          echo "=== After cleanup ==="
+          df -h /
+
+      - name: Set runner timezone to Asia/Shanghai
+        run: |
+          sudo timedatectl set-timezone Asia/Shanghai
+          timedatectl
+          # Also export TZ so Python and pmbootstrap see it
+          echo "TZ=Asia/Shanghai" >> $GITHUB_ENV
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git python3-pip python3-setuptools python3-venv python3-pexpect \
+            xz-utils gzip bzip2 zstd p7zip-full \
+            parted dosfstools mtools e2fsprogs btrfs-progs \
+            squashfs-tools cpio \
+            qemu-user-static binfmt-support \
+            ccache \
+            openssh-client \
+            file
+
+      - name: Set up Python venv and install pmbootstrap
+        run: |
+          python3 -m venv /opt/pmbootstrap-venv
+          /opt/pmbootstrap-venv/bin/pip install --upgrade pip setuptools wheel
+          /opt/pmbootstrap-venv/bin/pip install pmbootstrap
+          echo "/opt/pmbootstrap-venv/bin" >> $GITHUB_PATH
+
+      - name: Verify pmbootstrap
+        run: |
+          which pmbootstrap
+          pmbootstrap --version
+
+      - name: Create work directory
+        run: |
+          mkdir -p "$PMBOOTSTRAP_WORK"
+          echo "Work directory: $PMBOOTSTRAP_WORK"
+
+      - name: Cache pmaports repository
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PMBOOTSTRAP_WORK }}/cache_git/pmaports
+          key: pmaports-${{ inputs.channel }}-${{ github.run_id }}
+          restore-keys: |
+            pmaports-${{ inputs.channel }}-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PMBOOTSTRAP_WORK }}/ccache
+          key: ccache-${{ inputs.channel }}-${{ inputs.user_interface }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ inputs.channel }}-${{ inputs.user_interface }}-
+            ccache-${{ inputs.channel }}-
+
+      - name: Cache APK packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.PMBOOTSTRAP_WORK }}/cache_apk_*
+          key: apk-${{ inputs.channel }}-${{ github.run_id }}
+          restore-keys: |
+            apk-${{ inputs.channel }}-
+
+      - name: Update pmaports and pmbootstrap
+        run: |
+          pmbootstrap pull || true
+          pmbootstrap update || true
+
+      - name: Force clean (optional, slow)
+        if: ${{ inputs.force_clean == true }}
+        run: |
+          # Zap all chroots and locally-built packages for a fresh build.
+          # (HTTP/distfile caches are kept, GitHub Actions cache is kept too.)
+          yes | pmbootstrap zap -p 2>/dev/null || yes | pmbootstrap zap 2>/dev/null || true
+
+      - name: Run pmbootstrap init (non-interactive)
+        env:
+          PMOS_CHANNEL: ${{ inputs.channel }}
+          PMOS_AUDIO: ${{ inputs.audio_backend }}
+          PMOS_WIFI: ${{ inputs.wifi_backend }}
+          PMOS_USB: ${{ inputs.usb_mode }}
+          PMOS_UI: ${{ inputs.user_interface }}
+          PMOS_SYSTEMD: ${{ inputs.systemd_install }}
+          PMOS_UI_EXTRA: ${{ inputs.enable_ui_extra }}
+          PMOS_EXTRA_PACKAGES: ${{ inputs.extra_packages }}
+        run: |
+          python3 .github/scripts/pmbootstrap_init.py
+
+      - name: Show pmbootstrap config
+        run: |
+          echo "=== pmbootstrap config ==="
+          pmbootstrap config 2>/dev/null || true
+          echo "=== work dir layout ==="
+          ls -la "$PMBOOTSTRAP_WORK" || true
+
+      - name: Build rootfs image (pmbootstrap install)
+        env:
+          DEVICE_PASSWORD: ${{ inputs.device_password }}
+        run: |
+          # NOTE: --password avoids the interactive password prompt so the
+          # build can run non-interactively on CI. The password is logged in
+          # plain text in pmbootstrap's log file — that's why we use a dummy
+          # default (147258) that you should change after first boot.
+          if [ "${{ inputs.enable_fde }}" = "true" ]; then
+            echo "Running: pmbootstrap install --password *** --fde"
+            pmbootstrap install --password "$DEVICE_PASSWORD" --fde
+          else
+            echo "Running: pmbootstrap install --password ***"
+            pmbootstrap install --password "$DEVICE_PASSWORD"
+          fi
+
+      - name: Build Android recovery zip (optional)
+        if: ${{ inputs.build_recovery_zip == true }}
+        env:
+          DEVICE_PASSWORD: ${{ inputs.device_password }}
+        run: |
+          pmbootstrap install --password "$DEVICE_PASSWORD" --android-recovery-zip
+
+      - name: Export artifacts to a known location
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cd "$GITHUB_WORKSPACE/artifacts"
+          pmbootstrap export
+          echo "=== Exported files ==="
+          ls -la "$GITHUB_WORKSPACE/artifacts" || true
+          ls -la /tmp/postmarketOS-export 2>/dev/null || true
+
+      - name: Compress artifacts
+        run: |
+          cd "$GITHUB_WORKSPACE/artifacts"
+          # Find exported images / boot files
+          EXPORT_DIR="/tmp/postmarketOS-export"
+          if [ -d "$EXPORT_DIR" ]; then
+            cp -avL "$EXPORT_DIR"/* "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          fi
+          # Also grab the raw rootfs image from the chroot, just in case
+          ROOTFS_DIR="$PMBOOTSTRAP_WORK/chroot_native/home/pmos/rootfs"
+          BOOT_DIR="$PMBOOTSTRAP_WORK/chroot_native/home/pmos/boot"
+          echo "=== rootfs dir ==="
+          ls -lah "$ROOTFS_DIR" 2>/dev/null || echo "(not found)"
+          echo "=== boot dir ==="
+          ls -lah "$BOOT_DIR" 2>/dev/null || echo "(not found)"
+
+          # Compress every .img file
+          for f in $(find "$GITHUB_WORKSPACE/artifacts" "$ROOTFS_DIR" "$BOOT_DIR" \
+                     -name "*.img" -type f 2>/dev/null); do
+            if [ ! -f "${f}.xz" ]; then
+              echo "Compressing: $f"
+              cp -f "$f" "$GITHUB_WORKSPACE/artifacts/$(basename "$f")" 2>/dev/null || true
+              xz -T0 -9 -v "$GITHUB_WORKSPACE/artifacts/$(basename "$f")"
+            fi
+          done
+
+          # Recovery zip
+          for z in $(find "$PMBOOTSTRAP_WORK" -name "*polaris*.zip" -type f 2>/dev/null); do
+            cp -f "$z" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          done
+
+          # Build info
+          cat > "$GITHUB_WORKSPACE/artifacts/build-info.txt" << EOF
+          postmarketOS build for Xiaomi Polaris (xiaomi-polaris)
+          =====================================================
+          Build date (UTC):  $(date -u '+%Y-%m-%d %H:%M:%S')
+          Build runner:      ${{ runner.os }} ${{ runner.arch }}
+          GitHub run:        ${{ github.run_id }} / #${{ github.run_number }}
+
+          Device:           xiaomi-polaris
+          Channel:          ${{ inputs.channel }}
+          User interface:   ${{ inputs.user_interface }}
+          Audio backend:    ${{ inputs.audio_backend }}
+          WiFi backend:     ${{ inputs.wifi_backend }}
+          USB mode:         ${{ inputs.usb_mode }}
+          systemd:          ${{ inputs.systemd_install }}
+          UI extra pkgs:    ${{ inputs.enable_ui_extra }}
+          FDE:              ${{ inputs.enable_fde }}
+          Recovery zip:     ${{ inputs.build_recovery_zip }}
+
+          Extra packages:   ${{ inputs.extra_packages }}
+          Chinese fonts:    font-noto-cjk, font-wqy-zenhei, font-wqy-microhei
+
+          Locale:           zh_CN.UTF-8
+          Timezone:         Asia/Shanghai
+          Hostname:         xiaomi-polaris
+
+          *** IMPORTANT — DEVICE PASSWORD ***
+          The device user/encryption password is: ${{ inputs.device_password }}
+          This is a DUMMY password (visible in the CI logs). CHANGE IT
+          immediately after first boot:
+            - User password:  passwd
+            - FDE password:   see postmarketOS docs (cryptsetup luksChangeKey)
+          ***********************************
+
+          pmbootstrap version:
+          $(pmbootstrap --version 2>&1 || echo "unknown")
+
+          Flash instructions:
+          -------------------
+          1. Boot your Xiaomi Mi MIX 2S (polaris) into fastboot mode
+             (hold Volume Down + Power while booting).
+          2. Make sure bootloader is unlocked.
+          3. Decompress the images:
+               unxz boot.img.xz
+               unxz xiaomi-polaris.img.xz
+          4. Flash boot image:
+               fastboot flash boot boot.img
+          5. Flash rootfs to userdata partition:
+               fastboot flash userdata xiaomi-polaris.img
+          6. Reboot:
+               fastboot reboot
+          7. Login with username 'user' and the device password set above.
+          8. CHANGE THE PASSWORD IMMEDIATELY.
+          EOF
+
+          echo "=== Final artifacts ==="
+          ls -lah "$GITHUB_WORKSPACE/artifacts"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pmos-xiaomi-polaris-${{ inputs.user_interface }}-${{ github.run_number }}
+          path: ${{ github.workspace }}/artifacts/
+          retention-days: 14
+          compression-level: 0
+
+      - name: Print pmbootstrap log on failure
+        if: failure()
+        run: |
+          echo "=== Build FAILED — printing last 500 lines of log ==="
+          LOGFILE="$PMBOOTSTRAP_WORK/log.txt"
+          if [ -f "$LOGFILE" ]; then
+            tail -n 500 "$LOGFILE" || true
+          else
+            echo "(log file not found at $LOGFILE)"
+          fi
+          echo "=== Listing work dir for debugging ==="
+          ls -la "$PMBOOTSTRAP_WORK" || true
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Build summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Device:** xiaomi-polaris" >> $GITHUB_STEP_SUMMARY
+          echo "**Channel:** ${{ inputs.channel }}" >> $GITHUB_STEP_SUMMARY
+          echo "**UI:** ${{ inputs.user_interface }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Download artifacts from the workflow run page (retained for 14 days)." >> $GITHUB_STEP_SUMMARY
