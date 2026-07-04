@@ -228,9 +228,11 @@ jobs:
           which pmbootstrap
           pmbootstrap --version
 
-      - name: Create work directory
+      - name: Create work directory and prepare cache directories
         run: |
           mkdir -p "$PMBOOTSTRAP_WORK"
+          mkdir -p "$PMBOOTSTRAP_WORK/cache_git/pmaports"
+          mkdir -p "$PMBOOTSTRAP_WORK/ccache"
           echo "Work directory: $PMBOOTSTRAP_WORK"
 
       - name: Cache pmaports repository
@@ -259,11 +261,6 @@ jobs:
           restore-keys: |
             apk-${{ inputs.channel }}-
 
-      - name: Update pmaports and pmbootstrap
-        run: |
-          pmbootstrap pull || true
-          pmbootstrap update || true
-
       - name: Force clean (optional, slow)
         if: ${{ inputs.force_clean == true }}
         run: |
@@ -282,7 +279,34 @@ jobs:
           PMOS_UI_EXTRA: ${{ inputs.enable_ui_extra }}
           PMOS_EXTRA_PACKAGES: ${{ inputs.extra_packages }}
         run: |
+          set -euo pipefail
+          # The init script uses pexpect to drive pmbootstrap init non-interactively.
+          # It sets NO_COLOR=1 to disable ANSI codes in prompts so regexes match.
           python3 .github/scripts/pmbootstrap_init.py
+
+      - name: Verify pmbootstrap initialization
+        run: |
+          set -euo pipefail
+          # pmbootstrap_v3.cfg is the config file created by pmbootstrap init
+          CFG_FILE="$HOME/.config/pmbootstrap_v3.cfg"
+          if [ ! -f "$CFG_FILE" ]; then
+            echo "ERROR: pmbootstrap config file not found at $CFG_FILE"
+            echo "This means 'pmbootstrap init' did not complete successfully."
+            exit 1
+          fi
+          echo "Found config: $CFG_FILE"
+          cat "$CFG_FILE" || true
+          echo "---"
+          pmbootstrap config
+
+      - name: Update pmaports and pmbootstrap
+        run: |
+          set -euo pipefail
+          # These MUST run after init (they need a config + pmaports dir).
+          # 'pull' updates the pmaports git repo to the latest commit on the
+          # channel branch. 'update' refreshes package indexes in chroots.
+          pmbootstrap pull || true
+          pmbootstrap update || true
 
       - name: Show pmbootstrap config
         run: |
