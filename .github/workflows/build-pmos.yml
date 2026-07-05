@@ -231,8 +231,10 @@ jobs:
       - name: Create work directory and prepare cache directories
         run: |
           mkdir -p "$PMBOOTSTRAP_WORK"
-          mkdir -p "$PMBOOTSTRAP_WORK/cache_git/pmaports"
           mkdir -p "$PMBOOTSTRAP_WORK/ccache"
+          # Do NOT pre-create cache_git/pmaports — pmbootstrap will clone it
+          # itself during 'pmbootstrap init'. If we pre-create an empty dir,
+          # pmbootstrap detects it as an invalid pmaports repo and crashes.
           echo "Work directory: $PMBOOTSTRAP_WORK"
 
       - name: Cache pmaports repository
@@ -242,6 +244,18 @@ jobs:
           key: pmaports-${{ inputs.channel }}-${{ github.run_id }}
           restore-keys: |
             pmaports-${{ inputs.channel }}-
+
+      - name: Ensure pmaports dir is valid or absent
+        # If a previous run cached an incomplete/invalid pmaports dir
+        # (missing pmaports.cfg), remove it so pmbootstrap can re-clone.
+        run: |
+          PMAPORTS_DIR="$PMBOOTSTRAP_WORK/cache_git/pmaports"
+          if [ -d "$PMAPORTS_DIR" ] && [ ! -f "$PMAPORTS_DIR/pmaports.cfg" ]; then
+            echo "WARNING: Invalid cached pmaports dir detected (missing pmaports.cfg), removing: $PMAPORTS_DIR"
+            rm -rf "$PMAPORTS_DIR"
+          else
+            echo "pmaports dir OK (or absent)"
+          fi
 
       - name: Cache ccache
         uses: actions/cache@v4
