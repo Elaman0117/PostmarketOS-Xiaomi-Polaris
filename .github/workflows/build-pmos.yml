@@ -396,13 +396,26 @@ jobs:
           ls -lah "$BOOT_DIR" 2>/dev/null || echo "(not found)"
 
           # Compress every .img file
-          for f in $(find "$GITHUB_WORKSPACE/artifacts" "$ROOTFS_DIR" "$BOOT_DIR" \
-                     -name "*.img" -type f 2>/dev/null); do
-            if [ ! -f "${f}.xz" ]; then
-              echo "Compressing: $f"
-              cp -f "$f" "$GITHUB_WORKSPACE/artifacts/$(basename "$f")" 2>/dev/null || true
-              xz -T0 -9 -v "$GITHUB_WORKSPACE/artifacts/$(basename "$f")"
+          # Use -print0 + while read -d '' for safe filename handling
+          find "$GITHUB_WORKSPACE/artifacts" "$ROOTFS_DIR" "$BOOT_DIR" \
+            -name "*.img" -type f 2>/dev/null -print0 | while IFS= read -r -d '' f; do
+            base="$(basename "$f")"
+            dst="$GITHUB_WORKSPACE/artifacts/$base"
+            dst_xz="${dst}.xz"
+
+            # If the compressed file already exists in artifacts, skip
+            if [ -f "$dst_xz" ]; then
+              echo "Skip (already compressed): $dst_xz"
+              continue
             fi
+
+            # Copy source to artifacts if not already there
+            if [ "$f" != "$dst" ]; then
+              cp -f "$f" "$dst"
+            fi
+
+            echo "Compressing: $dst"
+            xz -T0 -9 -v "$dst"
           done
 
           # Recovery zip
