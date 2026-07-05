@@ -245,48 +245,26 @@ def send_answer(answer):
 
 
 # ---------------------------------------------------------------------
-# Step 3: Drive the prompts.
+# Step 3: Drive the prompts using PROMPT-BASED matching.
 #
-# Strategy: maintain a pointer into the answer list. For each prompt
-# pmbootstrap prints, send the next answer. The only tricky part is
-# the conditional "Enable this package?" prompt which only appears for
-# some UIs — we handle it by checking the prompt text.
+# Instead of a fixed-index answer list (which breaks when pmbootstrap
+# changes prompt order or adds/removes prompts), we match each prompt
+# by its text content and send the appropriate answer.
 #
-# If the prompt text contains "Enable this package", we send ui_extra.
-# Otherwise, we send the next answer from the list.
-#
-# The answer list includes the ui_extra answer at position 10. If the
-# UI doesn't have the extra prompt, we skip that answer.
+# This is robust against:
+#   - Locale prompting once vs. twice (pmbootstrap version-dependent)
+#   - The conditional "Enable this package?" prompt (UI-dependent)
+#   - The "Zap existing chroots?" prompt (appears when config changes)
+#   - Hostname re-prompting after validation error
 # ---------------------------------------------------------------------
 
-# Answers in order (including conditional UI extra at index 10):
-all_answers = [
-    "",              # 0: Work path
-    "",              # 1: pmaports path
-    channel,         # 2: Channel
-    VENDOR,          # 3: Vendor
-    DEVICE,          # 4: Device codename
-    "",              # 5: Username
-    audio,           # 6: Audio provider
-    wifi,            # 7: WiFi provider
-    usb_mode,        # 8: USB mode provider
-    ui,              # 9: User interface
-    ui_extra,        # 10: Enable this package? (CONDITIONAL — may not appear)
-    systemd,         # 11: Install systemd?
-    "",              # 12: Change them?
-    extras_str,      # 13: Extra packages
-    "",              # 14: Use timezone?
-    LOCALE,          # 15: Locale (first)
-    LOCALE,          # 16: Locale (second)
-    "",              # 17: Hostname
-    "y",             # 18: Build outdated?
-]
+# Counters for prompts that can appear multiple times
+provider_count = 0
+locale_count = 0
+hostname_count = 0
 
-answer_idx = 0
-ui_extra_consumed = False
-
-while answer_idx < len(all_answers):
-    # Read until we see a prompt (fresh read — no existing buffer)
+while True:
+    # Read until we see a prompt
     text, is_prompt = read_until_prompt(timeout=300, existing_buf="")
 
     if not is_prompt:
@@ -303,30 +281,91 @@ while answer_idx < len(all_answers):
     # Get the last line (the prompt)
     last_line = stripped.rstrip().split('\n')[-1]
 
-    # Check for conditional "Enable this package?" prompt
-    if "Enable this package" in last_line:
-        print(f"\n[init] Conditional prompt 'Enable this package?' -> sending: {ui_extra!r}", flush=True)
-        send_answer(ui_extra)
-        # Mark that we consumed the ui_extra answer (at index 10)
-        if answer_idx <= 10:
-            answer_idx = 11  # Skip to systemd (index 11)
+    # Match the prompt against known patterns and send the right answer.
+    # This is robust against prompt order changes and optional prompts.
+    answer = None
+    desc = None
+
+    if re.search(r"Work path \[[^\]]*\]:", last_line):
+        answer, desc = "", "Work path"
+
+    elif re.search(r"pmaports path \[[^\]]*\]:", last_line):
+        answer, desc = "", "pmaports path"
+
+    elif re.search(r"Channel \[[^\]]*\]:", last_line):
+        answer, desc = channel, "Channel"
+
+    elif re.search(r"Vendor \[[^\]]*\]:", last_line):
+        answer, desc = VENDOR, "Vendor"
+
+    elif re.search(r"Device codename:", last_line):
+        answer, desc = DEVICE, "Device codename"
+
+    elif re.search(r"Username \[[^\]]*\]:", last_line):
+        answer, desc = "", "Username"
+
+    elif re.search(r"Provider \[[^\]]*\]:", last_line):
+        # Provider prompt appears 3 times: audio, wifi, usb_mode
+        # The default in brackets may be "default" or the actual provider name
+        # (if config was pre-written with a specific provider).
+        provider_count += 1
+        if provider_count == 1:
+            answer, desc = audio, "Audio provider"
+        elif provider_count == 2:
+            answer, desc = wifi, "WiFi provider"
+        elif provider_count == 3:
+            answer, desc = usb_mode, "USB mode provider"
         else:
-            answer_idx += 1
-        ui_extra_consumed = True
-        continue
+            answer, desc = "", f"Provider #{provider_count} (default)"
 
-    # Check if current answer_idx is the conditional UI extra (index 10)
-    # and the prompt is NOT "Enable this package" — skip it
-    if answer_idx == 10 and not ui_extra_consumed:
-        print(f"\n[init] (UI has no extra package prompt — skipping ui_extra answer)", flush=True)
-        answer_idx = 11  # Skip to systemd
-        # Fall through to send the systemd answer for THIS prompt
+    elif re.search(r"User interface \[[^\]]*\]:", last_line):
+        answer, desc = ui, "User interface"
 
-    # Send the answer at current index
-    answer = all_answers[answer_idx]
-    print(f"\n[init] Answer #{answer_idx} for prompt '{last_line[:60]}...' -> sending: {answer!r}", flush=True)
+    elif re.search(r"Enable this package\? \(y/n\) \[[yn]\]:", last_line):
+        answer, desc = ui_extra, "Enable UI extra (conditional)"
+
+    elif re.search(r"Install systemd\? \(default/always/never\) \[(default|always|never)\]:", last_line):
+        answer, desc = systemd, "systemd"
+
+    elif re.search(r"Change them\? \(y/n\) \[n\]:", last_line):
+        answer, desc = "", "Change additional options"
+
+    elif re.search(r"Extra packages \[[^\]]*\]:", last_line):
+        # Default may be "none" or the pre-written package list.
+        answer, desc = extras_str, "Extra packages"
+
+    elif re.search(r"Use this timezone instead of GMT\? \(y/n\) \[y\]:", last_line):
+        answer, desc = "", "Timezone"
+
+    elif re.search(r"Locale \[[^\]]*\]:", last_line):
+        # Locale may prompt once or twice depending on pmbootstrap version.
+        # Always send LOCALE — if it prompts twice, we send it twice.
+        locale_count += 1
+        answer, desc = LOCALE, f"Locale (#{locale_count})"
+
+    elif re.search(r"Device hostname[^:]*\[[^\]]*\]:", last_line):
+        # Hostname may re-prompt if validation fails.
+        # Always send empty (accept default: xiaomi-polaris).
+        hostname_count += 1
+        answer, desc = "", f"Hostname (#{hostname_count})"
+
+    elif re.search(r"Build outdated packages.*\(y/n\) \[y\]:", last_line):
+        answer, desc = "y", "Build outdated"
+
+    elif re.search(r"Zap existing chroots.*\(y/n\) \[y\]:", last_line):
+        # This prompt appears when config changed and chroots need zapping.
+        # Always answer "y" to zap and apply the new config.
+        answer, desc = "y", "Zap existing chroots"
+
+    else:
+        # Unknown prompt — print it and fail with context
+        print(f"\n[init] ERROR: unrecognized prompt", file=sys.stderr, flush=True)
+        print(f"[init] prompt text: {last_line!r}", file=sys.stderr, flush=True)
+        print(f"[init] full output: {stripped[-500:]}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+    print(f"\n[init] {desc} -> sending: {answer!r}", flush=True)
     send_answer(answer)
-    answer_idx += 1
 
 
 # ---------------------------------------------------------------------
