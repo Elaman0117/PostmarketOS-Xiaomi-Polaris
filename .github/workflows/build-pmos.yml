@@ -159,7 +159,7 @@ jobs:
           systemd:          ${{ inputs.systemd_install }}
           UI extra pkgs:    ${{ inputs.enable_ui_extra }}
           Extra packages:   ${{ inputs.extra_packages }}
-          Chinese fonts:    font-noto-cjk, font-wqy-zenhei, font-wqy-microhei (auto-added)
+          Chinese fonts:    font-noto-cjk, font-wqy-zenhei (auto-added)
           FDE:              ${{ inputs.enable_fde }}
           Device password:  ${{ inputs.device_password }}  <<< CHANGE THIS AFTER FIRST BOOT!
           Recovery zip:     ${{ inputs.build_recovery_zip }}
@@ -329,6 +329,46 @@ jobs:
           echo "=== work dir layout ==="
           ls -la "$PMBOOTSTRAP_WORK" || true
 
+      - name: Validate extra packages exist in repos
+        # Fail fast if any extra package (including Chinese fonts) doesn't
+        # exist in the APKINDEX. This catches renamed/removed packages
+        # before the long build step.
+        run: |
+          set -euo pipefail
+          # Chinese fonts that are ALWAYS installed
+          FONTS="font-noto-cjk font-wqy-zenhei"
+          # User-specified extra packages (comma-separated → space-separated)
+          USER_EXTRAS="${{ inputs.extra_packages }}"
+          USER_EXTRAS="${USER_EXTRAS//,/ }"
+
+          ALL_PKGS="$FONTS $USER_EXTRAS"
+          echo "Validating packages: $ALL_PKGS"
+          echo "(skipping 'none' if present)"
+          MISSING=""
+          for pkg in $ALL_PKGS; do
+            [ "$pkg" = "none" ] && continue
+            [ -z "$pkg" ] && continue
+            echo "  checking: $pkg"
+            if ! pmbootstrap -q apk info "$pkg" >/dev/null 2>&1; then
+              echo "    NOT FOUND in APKINDEX"
+              MISSING="$MISSING $pkg"
+            else
+              echo "    OK"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo ""
+            echo "ERROR: The following packages were not found in the repositories:"
+            for pkg in $MISSING; do
+              echo "  - $pkg"
+            done
+            echo ""
+            echo "Fix: remove or rename these packages in the workflow inputs or"
+            echo "     in the CHINESE_FONTS list in .github/scripts/pmbootstrap_init.py"
+            exit 1
+          fi
+          echo "All packages validated successfully."
+
       - name: Build rootfs image (pmbootstrap install)
         env:
           DEVICE_PASSWORD: ${{ inputs.device_password }}
@@ -412,7 +452,7 @@ jobs:
           Recovery zip:     ${{ inputs.build_recovery_zip }}
 
           Extra packages:   ${{ inputs.extra_packages }}
-          Chinese fonts:    font-noto-cjk, font-wqy-zenhei, font-wqy-microhei
+          Chinese fonts:    font-noto-cjk, font-wqy-zenhei
 
           Locale:           zh_CN.UTF-8
           Timezone:         Asia/Shanghai
