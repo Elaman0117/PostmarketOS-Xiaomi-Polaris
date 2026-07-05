@@ -332,13 +332,20 @@ jobs:
       - name: Build rootfs image (pmbootstrap install)
         env:
           DEVICE_PASSWORD: ${{ inputs.device_password }}
+          # PMB_FDE_PASSWORD: pmbootstrap reads this env var to pass the FDE
+          # password non-interactively to cryptsetup luksFormat. Without it,
+          # cryptsetup tries to read from stdin and fails with
+          # "Nothing to read on input." in CI.
+          # We use the same password as the device user password for simplicity.
+          PMB_FDE_PASSWORD: ${{ inputs.device_password }}
         run: |
-          # NOTE: --password avoids the interactive password prompt so the
-          # build can run non-interactively on CI. The password is logged in
-          # plain text in pmbootstrap's log file — that's why we use a dummy
-          # default (147258) that you should change after first boot.
+          # NOTE: --password avoids the interactive user password prompt.
+          # PMB_FDE_PASSWORD avoids the interactive FDE password prompt.
+          # Both are logged in plain text in pmbootstrap's log file — that's
+          # why we use a dummy default (147258) that you should change after
+          # first boot.
           if [ "${{ inputs.enable_fde }}" = "true" ]; then
-            echo "Running: pmbootstrap install --password *** --fde"
+            echo "Running: pmbootstrap install --password *** --fde (FDE password via PMB_FDE_PASSWORD env)"
             pmbootstrap install --password "$DEVICE_PASSWORD" --fde
           else
             echo "Running: pmbootstrap install --password ***"
@@ -349,6 +356,7 @@ jobs:
         if: ${{ inputs.build_recovery_zip == true }}
         env:
           DEVICE_PASSWORD: ${{ inputs.device_password }}
+          PMB_FDE_PASSWORD: ${{ inputs.device_password }}
         run: |
           pmbootstrap install --password "$DEVICE_PASSWORD" --android-recovery-zip
 
