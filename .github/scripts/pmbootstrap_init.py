@@ -61,9 +61,11 @@ TIMEZONE = "Asia/Shanghai"
 HOSTNAME = "xiaomi-polaris"
 
 CHINESE_FONTS = [
-    "font-noto-cjk",
-    "font-wqy-zenhei",
-    "font-wqy-microhei",
+    "font-noto-cjk",         # Noto CJK (most comprehensive — covers all CJK characters)
+    "font-wqy-zenhei",       # 文泉驿正黑 (lighter fallback)
+    # NOTE: font-wqy-microhei was removed from Alpine Linux and no longer
+    # exists in the APKINDEX. Do NOT add it — pmbootstrap will fail with
+    # "Could not find it in pmaports or any APKINDEX!".
 ]
 
 
