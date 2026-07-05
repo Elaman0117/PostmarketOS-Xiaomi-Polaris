@@ -358,7 +358,17 @@ jobs:
           DEVICE_PASSWORD: ${{ inputs.device_password }}
           PMB_FDE_PASSWORD: ${{ inputs.device_password }}
         run: |
-          pmbootstrap install --password "$DEVICE_PASSWORD" --android-recovery-zip
+          # Build recovery zip with the SAME FDE setting as the main install.
+          # If we don't pass --fde here when the main install used --fde,
+          # pmbootstrap will install postmarketos-base-nofde which conflicts
+          # with the already-installed unl0kr (FDE unlocker).
+          if [ "${{ inputs.enable_fde }}" = "true" ]; then
+            echo "Running: pmbootstrap install --password *** --android-recovery-zip --fde"
+            pmbootstrap install --password "$DEVICE_PASSWORD" --android-recovery-zip --fde
+          else
+            echo "Running: pmbootstrap install --password *** --android-recovery-zip"
+            pmbootstrap install --password "$DEVICE_PASSWORD" --android-recovery-zip
+          fi
 
       - name: Export artifacts to a known location
         run: |
