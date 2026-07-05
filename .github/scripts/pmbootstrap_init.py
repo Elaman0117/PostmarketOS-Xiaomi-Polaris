@@ -8,39 +8,32 @@ are populated from GitHub Actions workflow_dispatch inputs.
 
 Chinese font packages are ALWAYS added to the extra packages list.
 
-Implementation note
--------------------
-Previous versions used pexpect's native expect(), which had a
-buffering issue where the "pmaports path [...]" prompt was in the
-buffer but expect() didn't match it (likely a pexpect internal
-buffer state quirk when combined with logfile=sys.stdout).
+Implementation
+--------------
+Uses subprocess with stdin/stdout pipes (NOT a PTY). This avoids
+all the PTY echo, ANSI code, and pexpect buffering issues that
+plagued previous versions.
 
-This version uses a simpler, bulletproof approach:
-  - Spawn pmbootstrap in a PTY (via pexpect.spawn, but only for PTY)
-  - Read ALL available output into a single string buffer
-  - After each sendline(), read until the NEXT expected prompt appears
-    in the buffer (using re.search against the full accumulated text)
-  - Strip ANSI codes before matching (belt + suspenders with NO_COLOR)
+Strategy:
+  1. Pre-write ~/.config/pmbootstrap_v3.cfg with our desired values.
+     pmbootstrap will use these as defaults for the prompts.
+  2. Run `pmbootstrap init` with stdin=PIPE, stdout=PIPE.
+  3. Read pmbootstrap's output until we see a prompt (line ending with ": ").
+  4. Send the appropriate answer.
+  5. Repeat until pmbootstrap exits.
 
-This eliminates pexpect's internal buffer state as a variable.
+For the conditional "Enable this package?" prompt (only appears for
+some UIs), we detect it by reading the output and checking the text.
 """
 
+import configparser
 import os
 import re
-import sys
 import subprocess
-import time
+import sys
 import select
-
-# ---------------------------------------------------------------------
-# Make sure pexpect is available (we use it for PTY spawning).
-# ---------------------------------------------------------------------
-try:
-    import pexpect
-except ImportError:
-    print("[init] pexpect not found, installing via pip...", file=sys.stderr, flush=True)
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pexpect"])
-    import pexpect
+import time
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------
@@ -65,7 +58,7 @@ DEVICE = "polaris"
 
 LOCALE   = "zh_CN"
 TIMEZONE = "Asia/Shanghai"
-HOSTNAME = ""
+HOSTNAME = "xiaomi-polaris"
 
 CHINESE_FONTS = [
     "font-noto-cjk",
@@ -90,7 +83,7 @@ def build_extra_packages() -> str:
 extras_str = build_extra_packages()
 
 print("=" * 60, flush=True)
-print("pmbootstrap init — non-interactive driver", flush=True)
+print("pmbootstrap init — non-interactive driver (pipe-based)", flush=True)
 print("=" * 60, flush=True)
 print(f"  Vendor:           {VENDOR}  (FIXED)")
 print(f"  Device:           {DEVICE}  (FIXED)")
@@ -104,360 +97,255 @@ print(f"  systemd:          {systemd}")
 print(f"  Extra packages:   {extras_str}")
 print(f"  Locale:           {LOCALE}.UTF-8")
 print(f"  Timezone:         {TIMEZONE}")
-print(f"  Hostname:         (default = xiaomi-polaris)")
-print(f"  NO_COLOR:         1 (disables pmbootstrap ANSI codes)")
+print(f"  Hostname:         {HOSTNAME}")
 print("=" * 60, flush=True)
 
 
 # ---------------------------------------------------------------------
-# ANSI escape stripper (belt + suspenders with NO_COLOR).
+# Step 1: Pre-write the pmbootstrap config file.
 # ---------------------------------------------------------------------
-_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b[()][AB012]|\x1b[=>]")
+config_dir = Path.home() / ".config"
+config_dir.mkdir(parents=True, exist_ok=True)
+config_path = config_dir / "pmbootstrap_v3.cfg"
 
-def strip_ansi(s: str) -> str:
-    return _ANSI_ESCAPE.sub("", s)
+work_dir = os.environ.get("PMBOOTSTRAP_WORK", str(Path.home() / ".local/var/pmbootstrap"))
+pmaports_dir = os.path.join(work_dir, "cache_git", "pmaports")
+
+cfg = configparser.ConfigParser()
+cfg["pmbootstrap"] = {
+    "work": work_dir,
+    "aports": pmaports_dir,
+    "device": f"device-{VENDOR}-{DEVICE}",
+    "user": "user",
+    "ui": ui,
+    "ui_extras": "true" if ui_extra == "y" else "false",
+    "systemd": systemd,
+    "locale": LOCALE,
+    "keymap": "",
+    "extra_packages": extras_str,
+    "hostname": HOSTNAME,
+    "boot_size": "256",
+    "parallel_jobs": "16",
+    "ccache_size": "5G",
+    "sudo_timer": "false",
+    "mirror": "http://mirror.postmarketos.org/postmarketos/",
+    "is_default_channel": "false",
+}
+cfg["providers"] = {
+    "postmarketos-base-ui-audio-backend": audio,
+    "postmarketos-base-ui-wifi": wifi,
+    "postmarketos-usb-moded-default-profile": usb_mode,
+}
+cfg["mirrors"] = {}
+
+print(f"\n[init] Pre-writing config: {config_path}", flush=True)
+with open(config_path, "w") as f:
+    cfg.write(f)
+print(f"[init] Config written.", flush=True)
 
 
 # ---------------------------------------------------------------------
-# Spawn pmbootstrap init in a PTY.
-# We use pexpect.spawn ONLY to get a PTY; we do NOT use expect().
-# Instead, we manually read from child's PTY fd using select().
+# Step 2: Start pmbootstrap init with pipe I/O.
 # ---------------------------------------------------------------------
-print("\n[init] spawning: pmbootstrap init (with NO_COLOR=1)\n", flush=True)
+print(f"\n[init] Starting pmbootstrap init with pipe-based I/O...\n", flush=True)
 
-spawn_env = os.environ.copy()
-spawn_env["NO_COLOR"] = "1"
-spawn_env["PYTHONUNBUFFERED"] = "1"
-
-child = pexpect.spawn(
-    "pmbootstrap init",
-    timeout=300,
-    encoding="utf-8",
-    maxread=65536,           # large reads to get full prompts at once
-    env=spawn_env,
+proc = subprocess.Popen(
+    ["pmbootstrap", "init"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+    bufsize=0,  # unbuffered
+    env={**os.environ, "NO_COLOR": "1", "PYTHONUNBUFFERED": "1"},
 )
-# Do NOT set child.logfile — we manage output ourselves.
 
 
 # ---------------------------------------------------------------------
-# Read-all-available helper.
-# Reads everything currently available from the PTY without blocking.
-# Returns the raw string read (may be "" if nothing available).
+# Helper: read pmbootstrap output until a prompt appears or process exits.
+# A "prompt" is a line ending with ": " (colon space) or just ":".
+# Returns the accumulated output text.
 # ---------------------------------------------------------------------
-def read_available(timeout=0.5) -> str:
-    """Read all currently-available data from the child PTY."""
-    chunks = []
-    fd = child.child_fd
-    end_time = time.time() + timeout
-    while time.time() < end_time:
-        remaining = end_time - time.time()
-        ready, _, _ = select.select([fd], [], [], min(remaining, 0.1))
+def read_until_prompt(timeout=300, existing_buf=""):
+    """Read output until we see a NEW prompt (line ending with ': ').
+    Returns (text, is_prompt). Prints output to stdout as we read.
+
+    `existing_buf` is any leftover text from a previous read that should
+    be prepended. We start reading fresh from the pipe.
+    """
+    buf = existing_buf
+    deadline = time.time() + timeout
+    fd = proc.stdout.fileno()
+
+    # If existing_buf already ends with a prompt, return it immediately
+    # (but only if it's a COMPLETE prompt we haven't seen before).
+    # Actually, to avoid re-matching old prompts, we always read at least
+    # some new data first.
+
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        ready, _, _ = select.select([fd], [], [], min(remaining, 1.0))
         if not ready:
-            break
+            if proc.poll() is not None:
+                # Process exited — drain remaining output
+                try:
+                    remaining_data = os.read(fd, 65536).decode("utf-8", errors="replace")
+                    if remaining_data:
+                        buf += remaining_data
+                        sys.stdout.write(remaining_data)
+                        sys.stdout.flush()
+                except OSError:
+                    pass
+                return buf, False
+            # Check if buf already contains a prompt (from existing_buf)
+            if buf:
+                stripped_check = buf.rstrip("\r\n")
+                if stripped_check.endswith(": ") or stripped_check.endswith(":"):
+                    # Wait a bit more to make sure no more data is coming
+                    # (the prompt might be incomplete)
+                    time.sleep(0.1)
+                    ready2, _, _ = select.select([fd], [], [], 0.1)
+                    if not ready2:
+                        return buf, True
+            continue
+
         try:
-            data = os.read(fd, 65536)
-            if not data:
-                # EOF
-                break
-            chunks.append(data.decode("utf-8", errors="replace"))
+            data = os.read(fd, 65536).decode("utf-8", errors="replace")
         except OSError:
             break
-        # Reset timeout to drain quickly once we start getting data
-        end_time = time.time() + 0.2
-    return "".join(chunks)
-
-
-# ---------------------------------------------------------------------
-# The core: wait for a prompt, then send a reply.
-#
-# We accumulate ALL output into `buffer`, strip ANSI, and search for
-# the pattern. If found, we send the reply and clear the buffer up to
-# the match. If not found within timeout, we fail with a clear error.
-# ---------------------------------------------------------------------
-buffer = ""
-
-def wait_and_send(pattern, send_text="", timeout=120, step=""):
-    """Wait for `pattern` (regex) to appear in the stripped output, then send `send_text`."""
-    global buffer
-    if step:
-        print(f"\n[init] {step}", flush=True)
-    print(f"[init]   -> waiting for: {pattern!r}", flush=True)
-
-    compiled = re.compile(pattern)
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-        # Read whatever is available (blocks up to 0.5s)
-        chunk = read_available(timeout=0.5)
-        if chunk:
-            # Print raw chunk to stdout so it appears in the Actions log
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-            buffer += chunk
-
-        # Check for EOF
-        if child.eof():
-            print(f"\n[init] ERROR: pmbootstrap exited unexpectedly", file=sys.stderr, flush=True)
-            print(f"[init] pattern not matched: {pattern}", file=sys.stderr, flush=True)
-            print(f"[init] last 2000 chars of stripped buffer:", file=sys.stderr, flush=True)
-            print(f"{strip_ansi(buffer)[-2000:]}", file=sys.stderr, flush=True)
-            sys.exit(1)
-
-        # Search for the pattern in the stripped buffer
-        stripped = strip_ansi(buffer)
-        m = compiled.search(stripped)
-        if m:
-            print(f"[init]   -> MATCHED!", flush=True)
-            if send_text:
-                print(f"[init]   -> sending: {send_text!r}", flush=True)
-                child.sendline(send_text)
-            else:
-                print(f"[init]   -> sending: <empty> (use default)", flush=True)
-                child.sendline("")
-            # Clear the buffer up to and including the match (in stripped space)
-            # Simplest: just clear the whole buffer, since each prompt is consumed.
-            buffer = ""
-            return
-
-    # Timeout
-    print(f"\n[init] ERROR: timeout ({timeout}s) waiting for: {pattern}", file=sys.stderr, flush=True)
-    print(f"[init] last 2000 chars of RAW buffer:", file=sys.stderr, flush=True)
-    print(f"{buffer[-2000:]!r}", file=sys.stderr, flush=True)
-    print(f"[init] last 2000 chars of STRIPPED buffer:", file=sys.stderr, flush=True)
-    print(f"{strip_ansi(buffer)[-2000:]}", file=sys.stderr, flush=True)
-    sys.exit(1)
-
-
-def wait_for_either(patterns, timeout=120, step=""):
-    """Wait for one of several patterns. Returns the index of the matched pattern."""
-    global buffer
-    if step:
-        print(f"\n[init] {step}", flush=True)
-    print(f"[init]   -> waiting for one of: {patterns}", flush=True)
-
-    compiled = [re.compile(p) for p in patterns]
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-        chunk = read_available(timeout=0.5)
-        if chunk:
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-            buffer += chunk
-
-        if child.eof():
-            print(f"\n[init] ERROR: pmbootstrap exited unexpectedly", file=sys.stderr, flush=True)
-            print(f"[init] last 2000 chars: {strip_ansi(buffer)[-2000:]}", file=sys.stderr, flush=True)
-            sys.exit(1)
-
-        stripped = strip_ansi(buffer)
-        for i, regex in enumerate(compiled):
-            m = regex.search(stripped)
-            if m:
-                print(f"[init]   -> MATCHED pattern {i}: {patterns[i]!r}", flush=True)
-                buffer = ""
-                return i
-
-    print(f"\n[init] ERROR: timeout ({timeout}s) waiting for: {patterns}", file=sys.stderr, flush=True)
-    print(f"[init] last 2000 chars of STRIPPED buffer:", file=sys.stderr, flush=True)
-    print(f"{strip_ansi(buffer)[-2000:]}", file=sys.stderr, flush=True)
-    sys.exit(1)
-
-
-# ---------------------------------------------------------------------
-# Steps 1-10: simple sequential prompts.
-# ---------------------------------------------------------------------
-
-# 1. Work path (default)
-wait_and_send(
-    r"Work path \[[^\]]*\]:",
-    send_text="",
-    step="Step 1/14: Work path (default)",
-)
-
-# 2. pmaports path (default)
-wait_and_send(
-    r"pmaports path \[[^\]]*\]:",
-    send_text="",
-    step="Step 2/14: pmaports path (default)",
-)
-
-# 3. Channel
-wait_and_send(
-    r"Channel \[[^\]]*\]:",
-    send_text=channel,
-    step=f"Step 3/14: Channel = {channel}",
-)
-
-# 4. Vendor (xiaomi, FIXED)
-wait_and_send(
-    r"Vendor \[[^\]]*\]:",
-    send_text=VENDOR,
-    step=f"Step 4/14: Vendor = {VENDOR}",
-)
-
-# 5. Device codename (polaris, FIXED)
-wait_and_send(
-    r"Device codename:",
-    send_text=DEVICE,
-    step=f"Step 5/14: Device = {DEVICE}",
-)
-
-# 6. Username (default 'user')
-wait_and_send(
-    r"Username \[[^\]]*\]:",
-    send_text="",
-    step="Step 6/14: Username (default: user)",
-)
-
-# 7. Audio backend provider
-wait_and_send(
-    r"Provider \[default\]:",
-    send_text=audio,
-    step=f"Step 7/14: Audio backend = {audio}",
-)
-
-# 8. WiFi backend provider
-wait_and_send(
-    r"Provider \[default\]:",
-    send_text=wifi,
-    step=f"Step 8/14: WiFi backend = {wifi}",
-)
-
-# 9. USB-moded default profile
-wait_and_send(
-    r"Provider \[default\]:",
-    send_text=usb_mode,
-    step=f"Step 9/14: USB mode = {usb_mode}",
-)
-
-# 10. User interface
-wait_and_send(
-    r"User interface \[[^\]]*\]:",
-    send_text=ui,
-    step=f"Step 10/14: User interface = {ui}",
-)
-
-# ---------------------------------------------------------------------
-# Step 11 & 12: UI extra package (CONDITIONAL) + systemd install.
-# ---------------------------------------------------------------------
-print(f"\n[init] Step 11-12/14: UI extra package (if any) + systemd", flush=True)
-
-index = wait_for_either([
-    r"Enable this package\? \(y/n\) \[n\]:",
-    r"Install systemd\? \(default/always/never\) \[default\]:",
-], timeout=300)
-
-if index == 0:
-    # UI extra package prompt appeared → answer it, then expect systemd.
-    print(f"[init]   -> UI extra package prompt found, sending: {ui_extra!r}", flush=True)
-    child.sendline(ui_extra)
-    wait_and_send(
-        r"Install systemd\? \(default/always/never\) \[default\]:",
-        send_text=systemd,
-        step=f"Step 12/14: systemd = {systemd}",
-    )
-else:
-    # No extra-package prompt → systemd prompt appeared directly.
-    print(f"[init]   -> no UI extra package prompt (UI has none)", flush=True)
-    print(f"[init]   -> sending systemd choice: {systemd!r}", flush=True)
-    child.sendline(systemd)
-
-# ---------------------------------------------------------------------
-# Steps 13-17: more sequential prompts.
-# ---------------------------------------------------------------------
-
-# 13. "Change additional options?" → no (default)
-wait_and_send(
-    r"Change them\? \(y/n\) \[n\]:",
-    send_text="",
-    step="Step 13/14: Change additional options? (no)",
-)
-
-# 14. Extra packages
-wait_and_send(
-    r"Extra packages \[none\]:",
-    send_text=extras_str,
-    step=f"Step 14/14: Extra packages = {extras_str}",
-)
-
-# 15. Timezone
-wait_and_send(
-    r"Use this timezone instead of GMT\? \(y/n\) \[y\]:",
-    send_text="",
-    step=f"Step 15/17: Timezone (default = host = {TIMEZONE})",
-)
-
-# ---------------------------------------------------------------------
-# Step 16: Locale — may prompt ONCE or TWICE.
-# ---------------------------------------------------------------------
-print(f"\n[init] Step 16/17: Locale = {LOCALE} (loop until hostname)", flush=True)
-locale_attempts = 0
-while True:
-    idx = wait_for_either([
-        r"Locale \[[^\]]*\]:",
-        r"Device hostname[^:]*\[[^\]]*\]:",
-    ], timeout=300)
-    if idx == 0:
-        locale_attempts += 1
-        if locale_attempts > 6:
-            print(f"[init] ERROR: too many locale prompts ({locale_attempts})", file=sys.stderr, flush=True)
-            sys.exit(1)
-        print(f"[init]   -> Locale prompt #{locale_attempts}, sending: {LOCALE!r}", flush=True)
-        child.sendline(LOCALE)
-    else:
-        # Hostname prompt matched.
-        print(f"[init]   -> Hostname prompt found (locale done after {locale_attempts} attempt(s))", flush=True)
-        print(f"[init]   -> sending: <empty> (default hostname)", flush=True)
-        child.sendline("")
-        break
-
-# 17. Build outdated packages
-wait_and_send(
-    r"Build outdated packages.*\(y/n\) \[y\]:",
-    send_text="y",
-    step="Step 17/17: Build outdated packages? (yes)",
-)
-
-# ---------------------------------------------------------------------
-# Wait for pmbootstrap init to finish (EOF).
-# ---------------------------------------------------------------------
-print("\n[init] Waiting for pmbootstrap init to finish...", flush=True)
-deadline = time.time() + 1800
-finished = False
-while time.time() < deadline:
-    chunk = read_available(timeout=1.0)
-    if chunk:
-        sys.stdout.write(chunk)
-        sys.stdout.flush()
-    # Check for EOF: pexpect's eof() returns True if the child has exited
-    # AND we've read all remaining data. But we also need to handle the
-    # case where os.read returns empty (EOF on the fd).
-    try:
-        if child.eof():
-            finished = True
+        if not data:
             break
-    except Exception:
-        pass
-    # Also check if the process is still alive
-    if not child.isalive():
-        # Drain any remaining output
-        remaining = read_available(timeout=0.5)
-        if remaining:
-            sys.stdout.write(remaining)
-            sys.stdout.flush()
-        finished = True
-        break
 
-if not finished:
-    print(f"\n[init] ERROR: pmbootstrap init did not finish within 1800s", file=sys.stderr, flush=True)
+        buf += data
+        sys.stdout.write(data)
+        sys.stdout.flush()
+
+        # Check if the last line is a prompt (ends with ": " or ":")
+        stripped = buf.rstrip("\r\n")
+        if stripped.endswith(": ") or stripped.endswith(":"):
+            # Wait a tiny bit to see if more data comes (prompt might
+            # be followed by more text in some edge cases)
+            time.sleep(0.05)
+            ready2, _, _ = select.select([fd], [], [], 0.05)
+            if not ready2:
+                return buf, True
+            # More data is coming — keep reading
+
+    return buf, False
+
+
+def send_answer(answer):
+    """Send an answer (a line) to pmbootstrap's stdin."""
+    print(f"\n[init]   -> sending: {answer!r}", flush=True)
+    try:
+        proc.stdin.write(answer + "\n")
+        proc.stdin.flush()
+    except BrokenPipeError:
+        print(f"[init] ERROR: pmbootstrap closed stdin (process exited)", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------
+# Step 3: Drive the prompts.
+#
+# Strategy: maintain a pointer into the answer list. For each prompt
+# pmbootstrap prints, send the next answer. The only tricky part is
+# the conditional "Enable this package?" prompt which only appears for
+# some UIs — we handle it by checking the prompt text.
+#
+# If the prompt text contains "Enable this package", we send ui_extra.
+# Otherwise, we send the next answer from the list.
+#
+# The answer list includes the ui_extra answer at position 10. If the
+# UI doesn't have the extra prompt, we skip that answer.
+# ---------------------------------------------------------------------
+
+# Answers in order (including conditional UI extra at index 10):
+all_answers = [
+    "",              # 0: Work path
+    "",              # 1: pmaports path
+    channel,         # 2: Channel
+    VENDOR,          # 3: Vendor
+    DEVICE,          # 4: Device codename
+    "",              # 5: Username
+    audio,           # 6: Audio provider
+    wifi,            # 7: WiFi provider
+    usb_mode,        # 8: USB mode provider
+    ui,              # 9: User interface
+    ui_extra,        # 10: Enable this package? (CONDITIONAL — may not appear)
+    systemd,         # 11: Install systemd?
+    "",              # 12: Change them?
+    extras_str,      # 13: Extra packages
+    "",              # 14: Use timezone?
+    LOCALE,          # 15: Locale (first)
+    LOCALE,          # 16: Locale (second)
+    "",              # 17: Hostname
+    "y",             # 18: Build outdated?
+]
+
+answer_idx = 0
+ui_extra_consumed = False
+
+while answer_idx < len(all_answers):
+    # Read until we see a prompt (fresh read — no existing buffer)
+    text, is_prompt = read_until_prompt(timeout=300, existing_buf="")
+
+    if not is_prompt:
+        # Process may have exited (normal after the last answer)
+        if proc.poll() is not None:
+            print(f"\n[init] pmbootstrap exited (returncode={proc.returncode})", flush=True)
+            break
+        print(f"\n[init] ERROR: timeout or no prompt seen", file=sys.stderr, flush=True)
+        print(f"[init] last 1000 chars: {text[-1000:]}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+    # Strip ANSI from the text for matching
+    stripped = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+    # Get the last line (the prompt)
+    last_line = stripped.rstrip().split('\n')[-1]
+
+    # Check for conditional "Enable this package?" prompt
+    if "Enable this package" in last_line:
+        print(f"\n[init] Conditional prompt 'Enable this package?' -> sending: {ui_extra!r}", flush=True)
+        send_answer(ui_extra)
+        # Mark that we consumed the ui_extra answer (at index 10)
+        if answer_idx <= 10:
+            answer_idx = 11  # Skip to systemd (index 11)
+        else:
+            answer_idx += 1
+        ui_extra_consumed = True
+        continue
+
+    # Check if current answer_idx is the conditional UI extra (index 10)
+    # and the prompt is NOT "Enable this package" — skip it
+    if answer_idx == 10 and not ui_extra_consumed:
+        print(f"\n[init] (UI has no extra package prompt — skipping ui_extra answer)", flush=True)
+        answer_idx = 11  # Skip to systemd
+        # Fall through to send the systemd answer for THIS prompt
+
+    # Send the answer at current index
+    answer = all_answers[answer_idx]
+    print(f"\n[init] Answer #{answer_idx} for prompt '{last_line[:60]}...' -> sending: {answer!r}", flush=True)
+    send_answer(answer)
+    answer_idx += 1
+
+
+# ---------------------------------------------------------------------
+# Wait for pmbootstrap to finish.
+# ---------------------------------------------------------------------
+print(f"\n[init] Waiting for pmbootstrap init to complete...", flush=True)
+try:
+    remaining, _ = proc.communicate(timeout=600)
+    if remaining:
+        sys.stdout.write(remaining)
+        sys.stdout.flush()
+except subprocess.TimeoutExpired:
+    print(f"\n[init] ERROR: pmbootstrap init timed out", file=sys.stderr, flush=True)
+    proc.terminate()
     sys.exit(1)
 
-# Drain any final output
-try:
-    child.expect(pexpect.EOF, timeout=10)
-except Exception:
-    pass
+if proc.returncode != 0:
+    print(f"\n[init] ERROR: pmbootstrap init failed (exit code {proc.returncode})", file=sys.stderr, flush=True)
+    sys.exit(proc.returncode)
 
 print("\n[init] ===========================================", flush=True)
 print("[init] pmbootstrap init completed successfully!", flush=True)
